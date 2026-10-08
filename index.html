@@ -128,6 +128,7 @@
   <li><a href="#adapter">4 · 旁路注入</a></li>
   <li><a href="#moe">5 · 两位专家</a></li>
   <li><a href="#all">6 · 拼起来</a></li>
+  <li><a href="#data">7 · 训练数据</a></li>
 </ul></nav>
 
 <!-- 0 -->
@@ -224,13 +225,14 @@
   <table>
     <tr><th>任务</th><th>$F_c$ 中的内容</th><th>对生成的作用</th></tr>
     <tr><td>深度 / 姿态 / 边缘控制</td><td>控制信号（$M$ 全为 1）</td><td>结构引导</td></tr>
-    <tr><td>inpainting（掩码内）</td><td>原视频中待替换的像素</td><td>告诉模型原来是什么；可整体替换，也可部分沿用（如重新上色）</td></tr>
+    <tr><td>灰度上色</td><td>灰度视频（$M$ 全为 1）</td><td>保留亮度结构，重画颜色</td></tr>
+    <tr><td>inpainting（掩码内）</td><td>官方预处理把掩码内填成灰色，约等于 0</td><td>基本不提供信息，内容由文本和周围区域决定</td></tr>
     <tr><td>文生视频 / 续写的未知帧</td><td>全 0</td><td>不提供任何信息</td></tr>
   </table>
   <p>所以深度、姿态进入 $F_c$，是因为这类任务把 $M$ 设为全 1，而不是因为 $F_c$ 专门用来放控制信号。</p>
   <p>$F_k$ 也不总是逐像素照抄。参考生视频（R2V）中，参考图的 $M=0$，因此进入 $F_k$，但它不会原样出现在输出里：它只用来固定主体的身份与外观，解码后对应的参考帧会被去掉。</p>
   <div class="callout">
-    更准确的说法：$M$ 按“是否允许改变”把上下文帧切成两份。$F_k$ 是不可改变的已知内容，生成时要与之保持一致；$F_c$ 是可以改变区域中的原始信息，其约束强度取决于任务：控制信号起强结构引导作用，原视频内容只是弱参考，全零则没有信息。
+    更准确的说法：$M$ 按“是否允许改变”把上下文帧切成两份。$F_k$ 是不可改变的已知内容，生成时要与之保持一致；$F_c$ 是可以改变区域中放入的信息，其约束强度取决于任务：控制信号起强结构引导作用，灰度视频约束亮度，全零（或灰色填充）则没有信息。
   </div>
 </section>
 
@@ -386,13 +388,109 @@ video = vae.decode(x)</code></pre>
   </ul>
 </section>
 
+<!-- 7 -->
+<section id="data" class="reveal">
+  <div class="chapter">Chapter 7</div>
+  <h2>训练数据：从一段普通视频里“出题”</h2>
+  <p>一个模型要学十几种任务，难道要为每种任务收集成对的“输入—输出”数据？VACE 的答案是：<b>不用</b>。几乎所有任务都可以从一段<b>普通视频</b>自动造出来。</p>
+  <p>思路像老师出填空题：拿一段完整的视频 $x$ 当<span class="g">标准答案</span>，然后<span class="r">挖掉</span>一部分（掩码）或把它<span class="b">变换</span>成另一种形态（深度、姿态、灰度……），得到题目 $(F, M)$。模型的任务就是从题目和文本 $T$ 还原出原视频：</p>
+  $$x \;\xrightarrow{\ \text{挖空 / 变换}\ }\; (T,\,F,\,M) \;\xrightarrow{\ \text{VACE}\ }\; \hat x \approx x$$
+  <p>因为答案就是原视频本身，这些数据不需要人工标注，只需要视频、字幕描述和一组现成的视觉工具。</p>
+
+  <h3>公共流水线：先把视频“读懂”</h3>
+  <p>VACE 论文第 4.1 节描述的公共处理流程如下，各任务的数据都建立在它的产物上：</p>
+  <ul class="steps">
+    <li><b>切镜头与初筛</b>：按镜头切分视频，再按分辨率、美学评分、运动幅度过滤。</li>
+    <li><b>首帧打标签与检测</b>：用 RAM 给首帧打标签，再用 Grounding DINO 检测这些物体；目标区域过小或过大的视频被二次过滤。</li>
+    <li><b>全片分割跟踪</b>：用 SAM2 的传播功能把首帧的实例分割到整段视频，得到逐帧的实例掩码。</li>
+    <li><b>时间维过滤</b>：按掩码面积阈值统计每个实例的有效帧比例，过滤在大部分时间里消失或过小的实例。</li>
+  </ul>
+  <p>得到的是“视频 + 字幕 + 逐帧实例掩码”。下面逐任务看题目是怎么出的。</p>
+
+  <table>
+    <tr><th>任务</th><th>上下文帧 $F$ 怎么造</th><th>掩码 $M$</th><th>答案</th></tr>
+    <tr><td>文生视频 T2V</td><td>全 0</td><td>全 1</td><td>原视频</td></tr>
+    <tr><td>深度 / 涂鸦 / 姿态 / 光流</td><td>用现成模型从原视频<b>预先提取</b></td><td>全 1</td><td>原视频</td></tr>
+    <tr><td>灰度 / 布局</td><td>训练时<b>即时生成</b></td><td>全 1</td><td>原视频</td></tr>
+    <tr><td>Inpainting</td><td>原视频，掩码内置空</td><td>随机实例的掩码</td><td>原视频</td></tr>
+    <tr><td>Outpainting</td><td>原视频，掩码内置空</td><td>实例掩码取反</td><td>原视频</td></tr>
+    <tr><td>视频扩展（含首帧/首尾帧）</td><td>挑出的关键帧或片段，其余置空</td><td>已知帧为 0，其余为 1</td><td>原视频</td></tr>
+    <tr><td>参考生视频 R2V</td><td>从视频中抠出的人脸/物体 + 增强，放在最前面</td><td>参考帧为 0，视频帧为 1</td><td>原视频</td></tr>
+    <tr><td>任务组合</td><td>随机叠加上面几种</td><td>对应拼接</td><td>原视频</td></tr>
+  </table>
+
+  <h3>1. 文生视频（T2V）</h3>
+  <p>最简单：$F$ 全为 0，$M$ 全为 1，只有文本。它保证加上 VACE 之后，模型在“没有任何上下文”的情况下仍然能正常生成。</p>
+
+  <h3>2. 可控生成：深度、涂鸦、姿态、光流</h3>
+  <p>对过滤后的视频<b>离线预提取</b>控制信号，并都存成 RGB 视频，这样所有控制都能走同一条输入通道：</p>
+  <ul>
+    <li><b>深度</b>：单目深度估计模型 MiDaS（论文引用 Ranftl et al.）。</li>
+    <li><b>涂鸦（scribble）</b>：线稿生成模型 Informative Drawings（Chan et al.）。</li>
+    <li><b>姿态</b>：OpenPose 与 DWPose。</li>
+    <li><b>光流</b>：RAFT，再把光流可视化成彩色图。</li>
+  </ul>
+  <p>VCU 为 $F=\{\text{控制帧}\}$、$M$ 全 1，所以控制信号全部进入 $F_c$。答案是原视频：模型学的是“给定这条结构轨迹，画出与之吻合的真实画面”。</p>
+  <div class="callout blue">
+    为什么要预提取？这些模型较重，逐帧跑一遍代价高，所以提前算好存下来。灰度和布局计算很便宜，就在训练时即时生成。
+  </div>
+
+  <h3>3. 可控生成：灰度与布局</h3>
+  <ul>
+    <li><b>灰度（上色）</b>：把原视频转成灰度即可，$F$ = 灰度视频，$M$ 全 1。模型要保持亮度结构，补回颜色。</li>
+    <li><b>布局</b>：论文只说“即时生成”。从开源预处理工具看，做法是把公共流水线跟踪到的实例框画成逐帧的彩色方框，作为粗粒度的位置与运动轨迹控制。</li>
+  </ul>
+
+  <h3>4. 重绘：Inpainting 与 Outpainting</h3>
+  <p>这里直接复用公共流水线产出的实例掩码：</p>
+  <ul>
+    <li><b>Inpainting</b>：随机选一个实例，用它的逐帧掩码作 $M$。掩码内的像素被置空（官方预处理填成灰色），模型要依据文本和周围画面把这个物体画回来。</li>
+    <li><b>Outpainting</b>：把实例掩码<b>取反</b>，保留主体、重画周围环境。推理时常见的“向外扩画布”，可以看成掩码覆盖边框的特例。</li>
+    <li><b>无条件 inpainting（擦除）</b>：对掩码做 LaMa 风格的增强（随机形状、膨胀等），让掩码不再紧贴某个物体轮廓。这样模型学到的是“自然地补全背景”，而不是“必须在这里画一个物体”。</li>
+  </ul>
+  <p>论文还提到：<b>所有涉及掩码的操作都做了随机增强</b>，以适应各种粒度的局部编辑需求，例如用户只给一个粗糙的框，而不是精确轮廓。</p>
+
+  <h3>5. 视频扩展：首帧、尾帧、首尾帧、任意帧</h3>
+  <p>这类任务的掩码在<b>时间维</b>上：从原视频挑出若干已知帧，其余帧置空。论文列出的取法有：</p>
+  <div class="chips">
+    <span class="chip">首帧 → 图生视频</span>
+    <span class="chip">尾帧 → 倒推前面</span>
+    <span class="chip">首尾两帧 → 插帧过渡</span>
+    <span class="chip">随机若干帧 → 关键帧补全</span>
+    <span class="chip">首/尾一段 → 续写</span>
+  </div>
+  <p>已知帧的 $M=0$，进入 $F_k$；未知帧的 $M=1$、内容为空。这样一套数据就同时覆盖了 I2V、首尾帧生成和视频续写，不需要单独训练图生视频模型。</p>
+
+  <h3>6. 参考生视频（R2V）</h3>
+  <p>从视频中<b>抠出</b>若干人脸或物体实例（利用公共流水线的检测与分割结果），作为参考图 $r_1,\dots,r_l$ 放在帧序列最前面，掩码为 0；后面的视频帧为空、掩码为 1。答案仍是原视频。</p>
+  <p>关键是对参考图做<b>离线或在线增强</b>再配对。论文没有展开原因，一个合理的理解是：参考图直接来自同一段视频，如果不增强，模型可能学会把参考图原样贴到画面里，而不是“认出这个主体，再让它自然地动起来”。增强打破了像素级的对应关系，迫使模型只记住身份和外观。</p>
+  <p class="muted">推理时，官方代码会把参考图等比缩放后放在白色画布中央，这也暗示训练时参考图是“白底主体图”的形式。</p>
+
+  <h3>7. 任务组合</h3>
+  <p>论文明确说：训练时会<b>随机组合</b>上面的各种任务，例如“参考图 + inpainting”（把视频里的某个物体换成参考图里的主体）、“首帧 + 姿态”等。因为所有任务共享同一个 VCU 格式，组合只是把对应的帧和掩码拼起来，不需要额外设计数据。</p>
+
+  <h3>训练顺序：由易到难</h3>
+  <p>数据不是一股脑全部混在一起训练的。论文的第 5.1 节描述了分阶段的课程：</p>
+  <ul class="steps">
+    <li><b>基础任务</b>：先训练 inpainting 和扩展。它们与文生视频预训练最互补，让模型先学会掩码的含义，以及在空间和时间上“看上下文生成”。</li>
+    <li><b>任务扩展</b>：从单张参考图过渡到多张参考图，从单一任务过渡到组合任务。</li>
+    <li><b>质量微调</b>：用更高质量的数据和更长的序列做最后微调。</li>
+  </ul>
+  <p>训练输入支持任意分辨率、可变时长和可变帧率。基于 Wan2.1-T2V-14B 的版本覆盖“12 个任务 + 组合任务”，分辨率约 720p，训练 200k 步。</p>
+
+  <div class="callout red">
+    <p><b>关于 Wan2.2-VACE 的说明</b>：以上内容来自 VACE 论文（基于 Wan2.1 与 LTX-Video）及其开源预处理代码。目前的 Wan2.2-VACE-Fun-A14B 由阿里 PAI 训练，模型卡只说明了：以 VACE 方案训练、基础模型为 Wan2.2-T2V-A14B、支持 Canny、Depth、Pose、MLSD、轨迹控制和主体参考生成、以 81 帧 16 fps 在 512/768/1024 多分辨率上训练。<b>它的具体训练数据与构造流程没有公开</b>。Canny、MLSD、轨迹这几种控制不在 VACE 论文的列表里，说明它的数据至少在控制类型上有所扩展。</p>
+  </div>
+</section>
+
 <footer>
   参考资料：
   <a href="https://arxiv.org/abs/2503.07598" target="_blank" rel="noopener">VACE: All-in-One Video Creation and Editing (arXiv:2503.07598)</a> ·
   <a href="https://arxiv.org/abs/2503.20314" target="_blank" rel="noopener">Wan: Open and Advanced Large-Scale Video Generative Models (arXiv:2503.20314)</a> ·
   <a href="https://github.com/Wan-Video/Wan2.2" target="_blank" rel="noopener">Wan-Video/Wan2.2</a> ·
   <a href="https://github.com/ali-vilab/VACE" target="_blank" rel="noopener">ali-vilab/VACE</a> ·
-  <a href="https://github.com/aigc-apps/VideoX-Fun" target="_blank" rel="noopener">aigc-apps/VideoX-Fun</a>
+  <a href="https://github.com/aigc-apps/VideoX-Fun" target="_blank" rel="noopener">aigc-apps/VideoX-Fun</a> ·
+  <a href="https://huggingface.co/alibaba-pai/Wan2.2-VACE-Fun-A14B" target="_blank" rel="noopener">alibaba-pai/Wan2.2-VACE-Fun-A14B</a>
   <br>页面中的动画均为示意，用于建立直觉，不代表真实模型输出。
 </footer>
 
