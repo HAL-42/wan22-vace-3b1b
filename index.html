@@ -195,13 +195,13 @@
     <div class="controls" id="presetBtns" style="margin-top:0;margin-bottom:14px"></div>
     <div class="vcu-wrap"><div class="vcu-grid" id="vcuGrid"></div></div>
     <div class="preset-desc" id="presetDesc"></div>
-    <div class="caption">灰色 = 数值 0（在 $[-1,1]$ 归一化下即中灰）。<span class="b">蓝框</span>：模型必须保留的内容；<span class="y">黄框</span>：模型要重画的区域里“原来是什么”。</div>
+    <div class="caption">灰色 = 数值 0（在 $[-1,1]$ 归一化下即中灰）。<span class="b">蓝框</span>：模型必须保留的内容；<span class="y">黄框</span>：要重画的区域里放了什么提示（控制信号、灰度图，或者什么都没有）。按官方预处理，局部重绘和视频扩展时 $F$ 的掩码内会被填成灰色（画面扩展的预处理默认填黑色，这里统一画成灰色）。</div>
   </div>
 
   <h3>为什么要拆成两路？——概念解耦</h3>
   <p>注意上面最后两行。VACE 不直接把 $F$ 喂进模型，而是用掩码把它切成两份：</p>
   $$F_k = F \odot (1-M) \quad(\text{inactive，要保留的}),\qquad F_c = F \odot M \quad(\text{reactive，要改变的})$$
-  <p>原因是：同一个“视频帧”输入，在不同任务里含义完全相反。做局部编辑时，掩码外的像素是<span class="b">必须原样保留的事实</span>；掩码内的像素则只是<span class="y">“原来长这样，请改掉它”的参考</span>。如果把两者混在一起，模型得自己去猜每个像素的身份；拆开之后，这个信息被显式地告诉了它。</p>
+  <p>原因是：同一个“视频帧”输入，在不同任务里含义完全相反。做局部编辑时，掩码外的像素是<span class="b">必须原样保留的事实</span>；掩码内则是<span class="y">“这里要重画”的区域</span>，里面放的可能是控制信号，也可能什么都没有。如果把两者混在一起，模型得自己去猜每个像素的身份；拆开之后，这个信息被显式地告诉了它。</p>
 
   <table>
     <tr><th>任务</th><th>上下文帧 $F$</th><th>掩码 $M$</th></tr>
@@ -221,7 +221,7 @@
     <li>$F_k = F \odot (1-M)$：正确。它是 $M=0$ 位置的内容，属于模型必须遵守、不能改动的事实，例如首尾帧、续写的已知帧、inpainting 的掩码外区域。</li>
     <li>$F_c = F \odot M$：“用于引导生成”不够准确。深度、姿态只是其中一种情况。</li>
   </ul>
-  <p>划分依据是 $M$，而不是信号类型。$M=1$ 的位置都进入 $F_c$，表示“这里要重新生成，这是它原来的内容”。这些内容起什么作用，取决于 $F$ 里放的是什么：</p>
+  <p>划分依据是 $M$，而不是信号类型。$M=1$ 的位置都进入 $F_c$，表示“这里要重新生成，这是放在这里的提示”。这些内容起什么作用，取决于 $F$ 里放的是什么：</p>
   <table>
     <tr><th>任务</th><th>$F_c$ 中的内容</th><th>对生成的作用</th></tr>
     <tr><td>深度 / 姿态 / 边缘控制</td><td>控制信号（$M$ 全为 1）</td><td>结构引导</td></tr>
@@ -233,6 +233,20 @@
   <p>$F_k$ 也不总是逐像素照抄。参考生视频（R2V）中，参考图的 $M=0$，因此进入 $F_k$，但它不会原样出现在输出里：它只用来固定主体的身份与外观，解码后对应的参考帧会被去掉。</p>
   <div class="callout">
     更准确的说法：$M$ 按“是否允许改变”把上下文帧切成两份。$F_k$ 是不可改变的已知内容，生成时要与之保持一致；$F_c$ 是可以改变区域中放入的信息，其约束强度取决于任务：控制信号起强结构引导作用，灰度视频约束亮度，全零（或灰色填充）则没有信息。
+  </div>
+
+  <h3>常见疑问：局部重绘时，掩码内的上下文帧填 0 还是保留原像素？</h3>
+  <p><b>答：</b>官方做法是<b>填成灰色，也就是约等于 0</b>，不保留原像素。掩码负责告诉模型“哪里要画”，填充负责让这里不带任何旧内容。两者同时使用，并不冲突。</p>
+  <p>依据是 VACE 开源仓库的代码：</p>
+  <ul>
+    <li><code>vace/annotators/inpainting.py</code>：生成 inpainting 输入时执行 <code>masked_frame[bool_mask] = mask_color</code>，默认 <code>mask_color = 128</code>。归一化到 $[-1,1]$ 后约为 0。</li>
+    <li><code>vace/annotators/frameref.py</code>：视频扩展中的未知帧填 <code>127.5</code>，掩码为 255（即 1）。</li>
+    <li><code>vace/models/wan/wan_vace.py</code>：模型内部只计算 <code>inactive = F*(1-M)</code>、<code>reactive = F*M</code>，<b>不会自己清空掩码区域</b>。所以“清空”发生在预处理阶段，而不是模型里。</li>
+  </ul>
+  <p>因此，局部重绘时 $F_c = F\odot M \approx 0$，掩码内的信息只剩“这里需要生成”这一个事实，具体画什么由文本、参考图和周围的 $F_k$ 决定。</p>
+  <p>为什么要清空？如果训练时保留原像素，而答案又正是原视频，模型只要把 $F_c$ 抄过去 loss 就最低，学不到“补全”。清空之后，它才必须真正根据上下文生成。</p>
+  <div class="callout blue">
+    补充：模型代码并不阻止你在掩码内保留原像素。这样做时 $F_c$ 会带上原内容，可能让结果更贴近原来的结构。但这与官方 inpainting 的训练分布不一致，效果没有保证。需要“保留结构、只改外观”时，更稳妥的做法是把 $F$ 换成深度、姿态等控制信号，或使用灰度上色这类在训练中出现过的设定。
   </div>
 </section>
 
@@ -637,9 +651,9 @@ function drawParticles(g, w, h, P, sigma, opts = {}) {
     control: { name: '姿态/深度控制', ref: false, f: () => 'edge', m: () => 1,
       desc: '$F$ 换成从视频提取的控制信号（这里用边缘图示意，也可以是深度、姿态、光流、灰度…），$M$ 全为 1：所有像素都要重画，但要遵循控制信号的结构。' },
     inpaint: { name: '局部重绘', ref: false, f: () => 'rgb', m: (f, r, c) => (c >= 5 && r <= 3) ? 1 : 0,
-      desc: '$F$ 是原视频，$M$ 只在树的位置为 1。掩码外原样保留，掩码内根据文本（如“一盏路灯”）重新生成。' },
+      desc: '$M$ 只在树的位置为 1；按官方预处理，$F$ 中这块区域被填成灰色（≈0），所以 $F_c$ 几乎为空。掩码外原样保留，掩码内根据文本（如“一盏路灯”）和周围画面重新生成。' },
     outpaint: { name: '画面扩展', ref: false, f: () => 'rgb', m: (f, r, c) => (c < 2 || c > 5) ? 1 : 0,
-      desc: '中间保留、两侧掩码为 1：模型需要“想象”画框之外的内容，并与中间保持一致。' },
+      desc: '中间保留、两侧掩码为 1 且被填成常量色：模型需要“想象”画框之外的内容，并与中间保持一致。' },
     extend: { name: '视频续写', ref: false, f: (f) => f < 2 ? 'rgb' : 'zero', m: (f) => f < 2 ? 0 : 1,
       desc: '前两帧给定且保留，后面的帧为 0 且掩码为 1：从已有画面出发往后续写。' },
     firstlast: { name: '首尾帧插值', ref: false, f: (f) => (f === 0 || f === NF - 1) ? 'rgb' : 'zero', m: (f) => (f === 0 || f === NF - 1) ? 0 : 1,
@@ -693,12 +707,12 @@ function drawParticles(g, w, h, P, sigma, opts = {}) {
       return;
     }
     scene(g, w, h, col.f, col.mode);
-    if (kind === 'K' || kind === 'R') {
-      g.fillStyle = '#808080';
-      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
-        const m = col.mask[r * COLS + c];
-        if ((kind === 'K' && m) || (kind === 'R' && !m)) g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
-      }
+    // Official preprocessing fills masked pixels of real frames with gray before encoding.
+    const blankMasked = col.mode === 'rgb';
+    g.fillStyle = '#808080';
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const m = col.mask[r * COLS + c];
+      if ((m && (kind === 'K' || blankMasked)) || (kind === 'R' && !m)) g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
     }
   }
 
@@ -757,7 +771,7 @@ function drawParticles(g, w, h, P, sigma, opts = {}) {
     if (cols[i].mask[idx] === paintVal) return;
     cols[i].mask[idx] = paintVal;
     grid.querySelectorAll(`canvas[data-col="${i}"]`).forEach(cv => drawCell(cv, cols[i], cv.dataset.kind));
-    desc.innerHTML = '<b class="y">自定义</b>：你修改了掩码。白色格子里的内容会进入 $F_c$（待改），黑色格子里的内容进入 $F_k$（保留）。';
+    desc.innerHTML = '<b class="y">自定义</b>：你修改了掩码。黑色格子里的内容进入 $F_k$（保留）；白色格子进入 $F_c$（待生成）。对真实画面帧，白色格子会先被填成灰色，所以 $F_c$ 里几乎没有原内容。';
     renderMath(desc);
   }
   function attachPaint(cv, i) {
